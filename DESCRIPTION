@@ -1,0 +1,25 @@
+Package: spatiotempDQN
+Type: Package
+Title: Spatio-Temporal Deep Q-Learning with CNN-LSTM
+Version: 0.1.0
+Author: JongMin Kim
+Maintainer: JongMin Kim <>
+Description: Tools for simulating spatio-temporal data, training CNN-LSTM based DQN models, and evaluating policies using IPS.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+RoxygenNote: 7.2.3
+Imports:
+    keras,
+    tensorflow,
+    nnet,
+    stats,
+    utils,
+    methods
+Suggests:
+    testthat,
+    devtools,
+    roxygen2,
+    rmarkdown,
+    knitr
+VignetteBuilder: knitr
