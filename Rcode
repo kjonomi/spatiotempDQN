@@ -1,4 +1,4 @@
-# Full reproducible temporal multivariate + CNN-LSTM DQN + clustering with spatio-temporal fixes
+# Full reproducible temporal multivariate + CNN-LSTM DQN + clustering
 
 if (!requireNamespace("keras", quietly=TRUE)) install.packages("keras")
 if (!requireNamespace("tensorflow", quietly=TRUE)) install.packages("tensorflow")
