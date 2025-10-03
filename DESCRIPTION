@@ -1,0 +1,23 @@
+Package: spatiotempDQN
+Type: Package
+Title: Spatio-Temporal Deep Q-Network for Multi-Agent Environments
+Version: 0.1.0
+Authors@R: 
+    person("Jong-Min", "Kim", email = "kjonomi@example.com", role = c("aut", "cre"))
+Description: Implements a modular deep Q-learning framework for spatio-temporal synthetic data and real datasets (e.g., NYC Flights) with temporal + spatial features. Includes CNN-LSTM DQN building, weighted sampling, and CATE analysis.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+RoxygenNote: 7.3.2
+Imports: 
+    dplyr,
+    tidyr,
+    lubridate,
+    keras,
+    tensorflow,
+    nycflights13,
+    stats
+Suggests:
+    knitr,
+    rmarkdown,
+    testthat
