@@ -27,9 +27,7 @@ input_shape <- dim(sim_data$X_train)[2:3]
 # --- 2) Build CNN-LSTM DQN model ---
 model <- build_cnn_lstm_dqn(
   input_shape = input_shape,
-  n_actions = 3,
-  n_rewards = 2
-)
+  n_actions = 3)
 
 summary(model)
 
