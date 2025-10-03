@@ -13,7 +13,7 @@
 install.packages(c("keras", "tensorflow", "mclust", "factoextra", "cluster", "dplyr", "nycflights13", "nnet"))
 
 # Install spatiotempDQN from local tar.gz
-install.packages("spatiotempDQN.tar.gz", repos = NULL, type = "source")
+install.packages("spatiotempDQN_0.1.0.tar.gz", repos = NULL, type = "source")
 
 # Load the package
 library(spatiotempDQN)
