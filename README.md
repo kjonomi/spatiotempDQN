@@ -19,21 +19,20 @@ install.packages("spatiotempDQN_0.1.0.tar.gz", repos = NULL, type = "source")
 library(spatiotempDQN)
 
 # --- 1) Simulate temporal + spatial features ---
-sim_data <- simulate_temporal_features(
-  n_obs = 100,       # number of observations
-  T_steps = 10,      # time steps
-  p = 5              # original features per time step
-)
+sim_data <- simulate_temporal_features(n_obs = 100, T_steps = 10, p = 5)
 
 # Extract input shape for model building
-input_shape <- dim(sim_data$X_train)[2:3]  # T_steps x number of features
+input_shape <- dim(sim_data$X_train)[2:3]
 
 # --- 2) Build CNN-LSTM DQN model ---
 model <- build_cnn_lstm_dqn(
   input_shape = input_shape,
-  n_actions = 3,     # number of possible actions
-  n_rewards = 2      # multivariate rewards
+  n_actions = 3,
+  n_rewards = 2
 )
+
+summary(model)
+
 
 # --- 3) Train DQN ---
 res <- train_dqn(
