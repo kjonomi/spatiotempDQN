@@ -2,7 +2,7 @@ Package: spatiotempDQN
 Type: Package
 Title: Spatio-Temporal CNN-LSTM DQN Toolkit for Multivariate Rewards and Clustering
 Version: 0.1.0
-Authors@R: person(given = "JongMin", family = "Kim", email = "kjonomi@gmail.com", role = c("aut", "cre"))
+Authors@R: person(given = "Jong-Min", family = "Kim", email = "kjonomi@gmail.com", role = c("aut", "cre"))
 Maintainer: Jong-Min Kim <kjonomi@gmail.com>
 Description: Utilities to simulate spatio-temporal data, build CNN-LSTM DQN models using keras,
     train with optional uncertainty-weighted sampling, evaluate off-policy with IPS,
