@@ -38,4 +38,5 @@ str(nyc_data)
 # 5. CATE Clustering
 clusters <- cate_clustering(nyc_data$X_train, nyc_data$Y_obs_train, n_clusters = 3)
 table(clusters)
-
+hist(clusters)
+```
