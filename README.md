@@ -1,34 +1,17 @@
-# spatiotempDQN
+# Offline Fitted Q-Evaluation with Temporal CNN–LSTM + Spatial Graph Features + CATE Clustering
 
-**Offline Reinforcement Learning with Temporal CNN–LSTM,  
-Spatial Graph Features, and CATE Clustering**
+This repository demonstrates the implementation of **Offline Fitted Q-Evaluation (FQE)** using **CNN-LSTM networks** with temporal and spatial covariates. The goal is to estimate **Conditional Average Treatment Effects (CATE)**, and cluster observations based on their CATE estimates. The model also evaluates the policy using **Importance Sampling (IPS)** off-policy evaluation.
 
----
+The code also includes:
+- **Spatio-temporal feature generation**
+- **CATE clustering and visualization**
+- **Policy distribution summary**
 
-## Overview
+## Prerequisites
 
-`spatiotempDQN` implements an Offline Fitted Q-Evaluation (FQE) framework
-using a temporal CNN–LSTM architecture with spatial feature aggregation
-and heterogeneous treatment effect (CATE) clustering.
-
-The package supports:
-
-- Multi-action, multi-reward reinforcement learning
-- Offline policy evaluation (IPS + FQE)
-- Temporal convolution + LSTM modeling
-- Spatial graph feature aggregation
-- Conditional Average Treatment Effect (CATE) estimation
-- K-means clustering for heterogeneity discovery
-- Bootstrap confidence intervals
-- Simulation studies
-- Real-data applications (NYC Flights dataset)
-
----
-
-## Installation
-
-Install the development version from GitHub:
+To run the code, you need to install the following R packages:
 
 ```r
-install.packages("devtools")
-devtools::install_github("kjonomi/spatiotempDQN", force = TRUE)
+pkgs <- c("keras","tensorflow","mclust","cluster","factoextra",
+          "dplyr","ggplot2")
+for (p in pkgs) if (!requireNamespace(p, quietly=TRUE)) install.packages(p)
