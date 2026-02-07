@@ -1,7 +1,6 @@
 ############################################################
 # OFFLINE FITTED Q-EVALUATION WITH TEMPORAL CNN–LSTM
 # + SPATIAL GRAPH FEATURES + CATE CLUSTERING
-# (Reviewer-aligned implementation)
 ############################################################
 
 # --- Packages ---
