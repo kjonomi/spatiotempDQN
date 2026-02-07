@@ -31,4 +31,4 @@ Install the development version from GitHub:
 
 ```r
 install.packages("devtools")
-devtools::install_github("yourusername/spatiotempDQN", force = TRUE)
+devtools::install_github("kjonomi/spatiotempDQN", force = TRUE)
