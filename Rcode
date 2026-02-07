@@ -1,655 +1,737 @@
-# Full reproducible temporal multivariate + CNN-LSTM DQN + clustering
+############################################################
+# OFFLINE FITTED Q-EVALUATION WITH TEMPORAL CNN–LSTM
+# + SPATIAL GRAPH FEATURES + CATE CLUSTERING
+# (Reviewer-aligned implementation)
+############################################################
 
-if (!requireNamespace("keras", quietly=TRUE)) install.packages("keras")
-if (!requireNamespace("tensorflow", quietly=TRUE)) install.packages("tensorflow")
-if (!requireNamespace("mclust", quietly=TRUE)) install.packages("mclust")
-if (!requireNamespace("factoextra", quietly=TRUE)) install.packages("factoextra")
-if (!requireNamespace("cluster", quietly=TRUE)) install.packages("cluster")
-if (!requireNamespace("dplyr", quietly=TRUE)) install.packages("dplyr")
-
+# --- Packages ---
+pkgs <- c("keras","tensorflow","mclust","cluster","factoextra",
+          "dplyr","ggplot2")
+for (p in pkgs) if (!requireNamespace(p, quietly=TRUE)) install.packages(p)
 library(keras); library(tensorflow)
-library(mclust); library(cluster); library(factoextra); library(dplyr); library(ggplot2)
+library(mclust); library(cluster); library(factoextra)
+library(dplyr); library(ggplot2)
 
 set.seed(123)
 
-# --- Parameters ---
+############################################################
+# 1. PARAMETERS
+############################################################
+
 n <- 1200
 T_steps <- 10
-p <- 6                # original features per time step
+p_raw <- 6                # raw covariates
 n_actions <- 3
-n_rewards <- 2        # multivariate reward dims
+n_rewards <- 2
 train_frac <- 0.7
-
-# --- 1) Simulate temporal covariates X_long (n x T x p) ---
-X_base <- matrix(rnorm(n * p), nrow = n, ncol = p)
-
-X_long <- array(0, dim = c(n, T_steps, p))
-for (t in 1:T_steps) {
-  drift <- 0.2 * (t - 1)
-  noise <- matrix(rnorm(n * p, 0, 0.15), nrow = n, ncol = p)
-  X_long[, t, ] <- X_base + drift + noise
-}
-
-# --- 2) Compute spatial lag for feature 1 ---
-
-# Create neighbor indices: for simplicity, nearest 5 neighbors by Euclidean distance on feature 1 averaged over time
-feature1_avg <- rowMeans(X_long[, , 1])
-dist_mat <- as.matrix(dist(feature1_avg))
-k_nn <- 5
-nn_idx <- t(apply(dist_mat, 1, function(row) order(row)[2:(k_nn+1)]))  # exclude self (min dist)
-
-# Compute spatial lag for all samples, time steps, features
-p_final <- p * 2  # original + spatial lag features
-
-X_combined <- array(NA, dim = c(n, T_steps, p_final))
-
-# Copy original features
-X_combined[, , 1:p] <- X_long
-
-# Compute spatial lag features (for original features 1:p)
-spatial_lag <- array(0, dim = c(n, T_steps, p))
-for (t in 1:T_steps) {
-  for (j in 1:p) {
-    vals <- X_long[, t, j]
-    for (i in 1:n) {
-      spatial_lag[i, t, j] <- mean(vals[nn_idx[i, ]], na.rm = TRUE)
-    }
-  }
-}
-X_combined[, , (p + 1):p_final] <- spatial_lag
-
-# --- 3) Remove constant/NA features before scaling ---
-valid_features <- sapply(1:p_final, function(j) {
-  any(sapply(1:T_steps, function(t) {
-    sd(X_combined[, t, j], na.rm = TRUE) > 0
-  }))
-})
-cat("Removing constant features:", which(!valid_features), "\n")
-X_combined <- X_combined[, , valid_features, drop = FALSE]
-p_final <- dim(X_combined)[3]
-
-# --- 4) Standardize each feature across samples and time ---
-for (j in 1:p_final) {
-  for (t in 1:T_steps) {
-    mu <- mean(X_combined[, t, j], na.rm = TRUE)
-    sdv <- sd(X_combined[, t, j], na.rm = TRUE)
-    if (is.na(sdv) || sdv == 0) sdv <- 1
-    X_combined[, t, j] <- (X_combined[, t, j] - mu) / sdv
-  }
-}
-
-# Replace any remaining NA/Inf with zero
-X_combined[!is.finite(X_combined)] <- 0
-
-# --- 5) Treatment assignment W using original feature 1 and spatial lag feature 1 ---
-# Note: original feature 1 index in filtered features may not be 1 now, so find indices
-orig_feat1_idx <- which(valid_features)[1]           # first original feature (should be 1)
-spatial_feat1_idx <- which(valid_features)[p + 1]    # spatial lag for feature 1
-
-x1_avg <- rowMeans(X_combined[, , orig_feat1_idx])
-x2_avg <- rowMeans(X_combined[, , spatial_feat1_idx])
-
-# Fix any NA in averages
-x1_avg[!is.finite(x1_avg)] <- 0
-x2_avg[!is.finite(x2_avg)] <- 0
-
-logits <- cbind(3.5 * x1_avg, 3.5 * x2_avg, -3.5 * x1_avg)
-logits <- logits - apply(logits, 1, max)  # stabilize
-exp_logits <- exp(logits)
-prob_mat <- exp_logits / rowSums(exp_logits)
-
-# Safe sampling function to avoid NA probs
-safe_sample <- function(probs) {
-  if (any(is.na(probs)) || any(!is.finite(probs)) || sum(probs) == 0) {
-    probs <- rep(1/3, 3)
-  } else {
-    probs <- probs / sum(probs)
-  }
-  sample(0:2, 1, prob = probs)
-}
-W <- apply(prob_mat, 1, safe_sample)
-
-# --- 6) Potential outcomes with heterogeneous treatment effects ---
-base1 <- sin(rowMeans(X_combined[, , 1:3])) * 2 + rnorm(n, 0, 0.3)
-base2 <- cos(rowMeans(X_combined[, , 4:min(6,p_final)])) * 1.5 + rnorm(n, 0, 0.25)
-
-tau1_r1 <- 1.2 + 1.5 * x2_avg - 0.8 * x1_avg
-tau2_r1 <- 0.5 - 0.6 * x1_avg + 1.0 * x2_avg
-
-tau1_r2 <- -1.5 + 2.5 * x1_avg - 0.3 * x2_avg
-tau2_r2 <- -0.8 + 1.8 * x1_avg - 0.4 * x2_avg
-
-Y0 <- cbind(base1 + 0, base2 + 0)
-Y1 <- cbind(base1 + tau1_r1, base2 + tau1_r1)
-Y2 <- cbind(base1 + tau1_r2, base2 + tau2_r2)
-
-Y_obs <- matrix(NA, nrow = n, ncol = n_rewards)
-for (i in 1:n) {
-  if (W[i] == 0) Y_obs[i, ] <- Y0[i, ]
-  if (W[i] == 1) Y_obs[i, ] <- Y1[i, ]
-  if (W[i] == 2) Y_obs[i, ] <- Y2[i, ]
-}
-
-# --- 7) Train/test split ---
-train_idx <- sample(1:n, floor(train_frac * n))
-test_idx <- setdiff(1:n, train_idx)
-
-X_train <- X_combined[train_idx, , , drop = FALSE]
-X_test <- X_combined[test_idx, , , drop = FALSE]
-
-W_train <- W[train_idx]
-W_test <- W[test_idx]
-
-Y0_test <- Y0[test_idx, ]
-Y1_test <- Y1[test_idx, ]
-Y2_test <- Y2[test_idx, ]
-
-Y_obs_train <- Y_obs[train_idx, ]
-
-# --- 8) Build CNN-LSTM DQN model ---
-build_model <- function(T_steps, p, n_actions, n_rewards, lr = 1e-4) {
-  model <- keras_model_sequential() %>%
-    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu",
-                  input_shape = c(T_steps, p), padding = "causal") %>%
-    layer_lstm(units = 48, return_sequences = FALSE) %>%
-    layer_dense(units = 48, activation = "relu") %>%
-    layer_dense(units = n_actions * n_rewards, activation = "linear")
-  
-  weighted_mse <- function(y_true, y_pred) {
-    y_true_r <- k_reshape(y_true, shape = c(-1, n_actions, n_rewards))
-    y_pred_r <- k_reshape(y_pred, shape = c(-1, n_actions, n_rewards))
-    w_vec <- k_constant(c(0.6, 0.4))
-    se <- k_square(y_true_r - y_pred_r)
-    se_w <- se * w_vec
-    k_mean(se_w)
-  }
-  model %>% compile(optimizer = optimizer_adam(learning_rate = lr), loss = weighted_mse)
-  return(model)
-}
-
-model <- build_model(T_steps, p_final, n_actions, n_rewards)
-
-# --- 9) Training loop (same as your original train_dqn function) ---
-train_dqn <- function(X_train, W_train, Y_obs_train, epochs = 60, batch_size = 64,
-                      weighted_sampling = FALSE, model_init = NULL) {
-  n_train <- dim(X_train)[1]
-  if (is.null(batch_size)) batch_size <- n_train
-  if (is.null(model_init)) {
-    mod <- build_model(dim(X_train)[2], dim(X_train)[3], n_actions, n_rewards)
-  } else {
-    mod <- model_init
-  }
-  reward_log <- numeric(epochs)
-  for (ep in 1:epochs) {
-    if (weighted_sampling && ep > 1) {
-      weights <- get_sampling_weights(mod, X_train)
-      sample_idx <- sample(1:n_train, n_train, replace = TRUE, prob = weights)
-    } else {
-      sample_idx <- sample(1:n_train, n_train, replace = TRUE)
-    }
-    X_batch_all <- X_train[sample_idx, , , drop = FALSE]
-    W_batch_all <- W_train[sample_idx]
-    Y_batch_all <- Y_obs_train[sample_idx, , drop = FALSE]
-    idx_seq <- split(1:nrow(X_batch_all), ceiling(seq_along(1:nrow(X_batch_all)) / batch_size))
-    ep_rewards <- numeric(length(idx_seq))
-    for (b_i in seq_along(idx_seq)) {
-      ids <- idx_seq[[b_i]]
-      Xb <- X_batch_all[ids, , , drop = FALSE]
-      Wb <- W_batch_all[ids]
-      Yb <- Y_batch_all[ids, , drop = FALSE]
-      
-      # Check for NAs in batch and replace by 0 (defensive)
-      Xb[!is.finite(Xb)] <- 0
-      Yb[!is.finite(Yb)] <- 0
-      
-      Q_pred <- predict(mod, Xb)
-      Qt_array <- array(Q_pred, dim = c(nrow(Xb), n_actions, n_rewards))
-      for (ii in 1:nrow(Xb)) {
-        act <- Wb[ii] + 1
-        Qt_array[ii, act, ] <- Yb[ii, ]
-      }
-      Q_target_new <- matrix(Qt_array, nrow = nrow(Xb), ncol = n_actions * n_rewards)
-      
-      history <- mod %>% fit(x = Xb, y = Q_target_new, epochs = 1, verbose = 0)
-      ep_rewards[b_i] <- mean(apply(Qt_array, 1, function(z) mean(z)))
-    }
-    reward_log[ep] <- mean(ep_rewards)
-    
-    # Debugging output for NaNs:
-    if (is.nan(reward_log[ep]) || is.infinite(reward_log[ep])) {
-      cat("Warning: NaN/Inf in epoch", ep, "reward. Stopping training.\n")
-      break
-    }
-    if (ep %% 10 == 0) cat("Epoch", ep, "mean batch reward approx:", round(reward_log[ep], 4), "\n")
-  }
-  return(list(model = mod, rewards = reward_log))
-}
-
-# --- 10) Sampling weights helper ---
-softmax_vec <- function(x) { exp_x <- exp(x - max(x)); exp_x / sum(exp_x) }
-get_sampling_weights <- function(model, X_input) {
-  q_vals <- predict(model, X_input)
-  q_vals_array <- array(q_vals, dim = c(nrow(X_input), n_actions, n_rewards))
-  q_sum <- apply(q_vals_array, c(1, 2), sum)
-  prob_q <- t(apply(q_sum, 1, function(r) softmax_vec(r)))
-  entropy <- -rowSums(prob_q * log(prob_q + 1e-10))
-  qvar <- apply(q_sum, 1, var)
-  combined_uncertainty <- entropy + qvar
-  weights <- combined_uncertainty / max(combined_uncertainty)
-  weights[is.na(weights)] <- 1 / nrow(X_input)
-  return(weights)
-}
-
-# --- 11) Train models ---
-set.seed(123)
-res_uniform <- train_dqn(X_train, W_train, Y_obs_train, epochs = 60, batch_size = 64,
-                         weighted_sampling = FALSE, model_init = model)
-
-set.seed(123)
-model2 <- build_model(T_steps, p_final, n_actions, n_rewards)
-res_weighted <- train_dqn(X_train, W_train, Y_obs_train, epochs = 60, batch_size = 64,
-                          weighted_sampling = TRUE, model_init = model2)
-
-# --- 12) Predict Q-values on test set ---
-q_uni <- predict(res_uniform$model, X_test)
-q_wgt <- predict(res_weighted$model, X_test)
-
-q_uni_arr <- array(q_uni, dim = c(nrow(X_test), n_actions, n_rewards))
-q_wgt_arr <- array(q_wgt, dim = c(nrow(X_test), n_actions, n_rewards))
-
 reward_weights <- c(0.6, 0.4)
-q_uni_scalar <- apply(q_uni_arr, c(1, 2), function(x) sum(x * reward_weights))
-q_wgt_scalar <- apply(q_wgt_arr, c(1, 2), function(x) sum(x * reward_weights))
 
-pred_action_uni <- apply(q_uni_scalar, 1, which.max) - 1
-pred_action_wgt <- apply(q_wgt_scalar, 1, which.max) - 1
+############################################################
+# 2. TEMPORAL COVARIATE SIMULATION  X_i(t)
+############################################################
 
-# --- 13) CATE vectors and clustering ---
-cate_uni <- cbind(
-  tau10 = q_uni_scalar[, 2] - q_uni_scalar[, 1],
-  tau20 = q_uni_scalar[, 3] - q_uni_scalar[, 1]
+X_base <- matrix(rnorm(n * p_raw), n, p_raw)
+X_long <- array(0, dim = c(n, T_steps, p_raw))
+
+for (t in 1:T_steps) {
+  X_long[, t, ] <- X_base + 0.2*(t-1) +
+    matrix(rnorm(n*p_raw,0,0.15),n,p_raw)
+}
+
+############################################################
+# 3. SPATIAL GRAPH (DEFINED ONCE, NOT LEARNED)
+############################################################
+
+# Past-only historical mean of feature 1
+feat1_hist <- apply(X_long[,1:T_steps,1], 1, mean)
+
+dist_mat <- as.matrix(dist(feat1_hist))
+k_nn <- 5
+nn_idx <- t(apply(dist_mat,1,function(r) order(r)[2:(k_nn+1)]))
+
+# Spatial lag via graph aggregation
+X_spatial <- array(0, dim = c(n, T_steps, p_raw))
+for (t in 1:T_steps)
+  for (j in 1:p_raw)
+    for (i in 1:n)
+      X_spatial[i,t,j] <- mean(X_long[nn_idx[i,],t,j])
+
+############################################################
+# 4. STATE CONSTRUCTION  S_i
+#    (NO FUTURE LEAKAGE)
+############################################################
+
+# State = concat(temporal mean, last observation)
+construct_state <- function(X) {
+  X_mean <- apply(X, c(1,3), mean)
+  X_last <- X[,T_steps,]
+  cbind(X_mean, X_last)
+}
+
+S_raw <- construct_state(X_long)
+S_spat <- construct_state(X_spatial)
+S <- cbind(S_raw, S_spat)
+p_state <- ncol(S)
+
+S <- scale(S)
+S[!is.finite(S)] <- 0
+
+############################################################
+# 5. TREATMENT ASSIGNMENT (OBSERVATIONAL POLICY)
+############################################################
+
+x1 <- S[,1]
+x2 <- S[,p_raw+1]
+
+logits <- cbind(3*x1, 3*x2, -3*x1)
+logits <- logits - apply(logits,1,max)
+probs <- exp(logits)/rowSums(exp(logits))
+
+safe_sample <- function(p){
+  if(any(!is.finite(p))) p <- rep(1/3,3)
+  sample(0:2,1,prob=p)
+}
+A <- apply(probs,1,safe_sample)
+
+############################################################
+# 6. POTENTIAL OUTCOMES WITH HETEROGENEITY
+############################################################
+
+base1 <- sin(rowMeans(S[,1:3])) + rnorm(n,0,0.3)
+base2 <- cos(rowMeans(S[,4:6])) + rnorm(n,0,0.3)
+
+tau1 <- 1 + 1.5*x2 - 0.5*x1
+tau2 <- -1 + 2*x1
+
+Y0 <- cbind(base1, base2)
+Y1 <- cbind(base1 + tau1, base2 + tau1)
+Y2 <- cbind(base1 + tau2, base2 + tau2)
+
+Y_obs <- matrix(NA,n,n_rewards)
+for(i in 1:n){
+  if(A[i]==0) Y_obs[i,] <- Y0[i,]
+  if(A[i]==1) Y_obs[i,] <- Y1[i,]
+  if(A[i]==2) Y_obs[i,] <- Y2[i,]
+}
+
+############################################################
+# 7. TRAIN / TEST SPLIT
+############################################################
+
+idx_tr <- sample(1:n, floor(train_frac*n))
+idx_te <- setdiff(1:n, idx_tr)
+
+S_tr <- S[idx_tr,,drop=FALSE]
+S_te <- S[idx_te,,drop=FALSE]
+A_tr <- A[idx_tr]
+Y_tr <- Y_obs[idx_tr,]
+
+############################################################
+# 8. CNN–LSTM Q-NETWORK (TEMPORAL ONLY)
+############################################################
+
+build_qnet <- function(T,p,a,r,lr=1e-4){
+  model <- keras_model_sequential() %>%
+    layer_conv_1d(32,3,activation="relu",
+                  input_shape=c(T,p),padding="causal") %>%
+    layer_lstm(48) %>%
+    layer_dense(48,activation="relu") %>%
+    layer_dense(a*r)
+  
+  q_loss <- function(y_true,y_pred){
+    yt <- k_reshape(y_true,c(-1,a,r))
+    yp <- k_reshape(y_pred,c(-1,a,r))
+    w <- k_constant(reward_weights)
+    k_mean(k_square(yt-yp)*w)
+  }
+  
+  model %>% compile(optimizer=optimizer_adam(lr),loss=q_loss)
+  model
+}
+
+############################################################
+# 9. OFFLINE FITTED Q-EVALUATION (FQE)
+############################################################
+
+train_fqe <- function(X,A,Y,epochs=50,batch=64,
+                      importance_sampling=FALSE){
+  n <- nrow(X)
+  X_arr <- array(X,dim=c(n,1,ncol(X)))
+  model <- build_qnet(1,ncol(X),n_actions,n_rewards)
+  
+  for(ep in 1:epochs){
+    idx <- sample(1:n,n,replace=TRUE)
+    for(b in split(idx,ceiling(seq_along(idx)/batch))){
+      Q <- predict(model,X_arr[b,,,drop=FALSE],verbose=0)
+      Qarr <- array(Q,c(length(b),n_actions,n_rewards))
+      for(i in seq_along(b))
+        Qarr[i,A[b[i]]+1,] <- Y[b[i],]
+      model %>% fit(
+        X_arr[b,,,drop=FALSE],
+        matrix(Qarr,length(b),n_actions*n_rewards),
+        epochs=1,verbose=0
+      )
+    }
+    if(ep%%10==0) cat("Epoch",ep,"\n")
+  }
+  model
+}
+
+############################################################
+# 10. TRAIN MODEL
+############################################################
+
+q_model <- train_fqe(S_tr,A_tr,Y_tr)
+
+############################################################
+# 11. Q-VALUES & POLICY
+############################################################
+
+Q_te <- predict(q_model,
+                array(S_te,c(nrow(S_te),1,ncol(S_te))),
+                verbose=0)
+Qarr <- array(Q_te,c(nrow(S_te),n_actions,n_rewards))
+Qscalar <- apply(Qarr,c(1,2),
+                 function(x) sum(x*reward_weights))
+pi_hat <- apply(Qscalar,1,which.max)-1
+
+############################################################
+# 12. CATE ESTIMATION & CLUSTERING
+############################################################
+
+cate_hat <- cbind(
+  tau10 = Qscalar[,2]-Qscalar[,1],
+  tau20 = Qscalar[,3]-Qscalar[,1]
 )
-cate_wgt <- cbind(
-  tau10 = q_wgt_scalar[, 2] - q_wgt_scalar[, 1],
-  tau20 = q_wgt_scalar[, 3] - q_wgt_scalar[, 1]
-)
-
-Y0_test_sum <- Y0_test %*% reward_weights
-Y1_test_sum <- Y1_test %*% reward_weights
-Y2_test_sum <- Y2_test %*% reward_weights
-
-true_best_action <- apply(cbind(Y0_test_sum, Y1_test_sum, Y2_test_sum), 1, which.max) - 1
 
 set.seed(42)
 k <- 4
-km_uni <- kmeans(scale(cate_uni), centers = k, nstart = 50)
-km_wgt <- kmeans(scale(cate_wgt), centers = k, nstart = 50)
+km <- kmeans(scale(cate_hat),k,nstart=50)
 
-mc_uni <- Mclust(scale(cate_uni))
-mc_wgt <- Mclust(scale(cate_wgt))
+############################################################
+# 13. PCA (VISUALIZATION ONLY)
+############################################################
 
-ari <- function(labels, truth) adjustedRandIndex(labels, truth)
-
-cat("ARI kmeans (uniform):", round(ari(km_uni$cluster, true_best_action), 3), "\n")
-cat("ARI mclust (uniform):", round(ari(mc_uni$classification, true_best_action), 3), "\n")
-cat("ARI kmeans (weighted):", round(ari(km_wgt$cluster, true_best_action), 3), "\n")
-cat("ARI mclust (weighted):", round(ari(mc_wgt$classification, true_best_action), 3), "\n")
-
-# --- 14) Cluster profile summary ---
-df_summary <- data.frame(
-  cluster = km_wgt$cluster,
-  tau10_hat = cate_wgt[, 1],
-  tau20_hat = cate_wgt[, 2],
-  true_tau10 = (Y1_test_sum - Y0_test_sum),
-  true_tau20 = (Y2_test_sum - Y0_test_sum),
-  true_best = factor(true_best_action)
+pca <- prcomp(scale(cate_hat))
+df <- data.frame(
+  PC1=pca$x[,1], PC2=pca$x[,2],
+  cluster=factor(km$cluster)
 )
 
-cluster_profiles <- df_summary %>%
-  group_by(cluster) %>%
-  summarise(
-    n = n(),
-    mean_est_tau10 = mean(tau10_hat),
-    mean_est_tau20 = mean(tau20_hat),
-    mean_true_tau10 = mean(true_tau10),
-    mean_true_tau20 = mean(true_tau20),
-    prop_best0 = mean(true_best == 0),
-    prop_best1 = mean(true_best == 1),
-    prop_best2 = mean(true_best == 2)
+ggplot(df,aes(PC1,PC2,color=cluster)) +
+  geom_point(size=2,alpha=.8) +
+  theme_minimal() +
+  labs(title="PCA of Estimated CATEs")
+
+############################################################
+# 14. OUTPUT SUMMARY TABLE
+############################################################
+
+summary_table <- data.frame(
+  
+  Quantity = c(
+    "Sample size (n)",
+    "Time steps (T)",
+    "Raw covariates (p_raw)",
+    "State dimension (p_state)",
+    "Number of actions",
+    "Number of rewards",
+    "Train sample size",
+    "Test sample size",
+    "Mean observed reward 1",
+    "Mean observed reward 2",
+    "SD observed reward 1",
+    "SD observed reward 2",
+    "Mean Q(s,a=0)",
+    "Mean Q(s,a=1)",
+    "Mean Q(s,a=2)",
+    "Mean CATE (a1 − a0)",
+    "Mean CATE (a2 − a0)",
+    "Number of CATE clusters"
+  ),
+  
+  Value = c(
+    n,
+    T_steps,
+    p_raw,
+    p_state,
+    n_actions,
+    n_rewards,
+    length(idx_tr),
+    length(idx_te),
+    round(mean(Y_obs[,1]), 3),
+    round(mean(Y_obs[,2]), 3),
+    round(sd(Y_obs[,1]), 3),
+    round(sd(Y_obs[,2]), 3),
+    round(mean(Qscalar[,1]), 3),
+    round(mean(Qscalar[,2]), 3),
+    round(mean(Qscalar[,3]), 3),
+    round(mean(cate_hat[,1]), 3),
+    round(mean(cate_hat[,2]), 3),
+    k
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+summary_table
+
+policy_table <- as.data.frame(table(pi_hat))
+colnames(policy_table) <- c("Action", "Count")
+policy_table$Proportion <- round(policy_table$Count / sum(policy_table$Count), 3)
+
+policy_table
+
+cluster_table <- as.data.frame(table(km$cluster))
+colnames(cluster_table) <- c("Cluster", "Size")
+cluster_table$Proportion <- round(cluster_table$Size / sum(cluster_table$Size), 3)
+
+cluster_table
+
+knitr::kable(
+  summary_table,
+  caption = "Summary of Offline FQE CNN–LSTM Simulation Outputs"
+)
+
+knitr::kable(
+  policy_table,
+  caption = "Learned Policy Distribution (Test Set)"
+)
+
+knitr::kable(
+  cluster_table,
+  caption = "CATE Cluster Sizes"
+)
+
+# Oracle CATEs from DGP
+cate_oracle <- cbind(
+  tau10 = tau1[idx_te],
+  tau20 = tau2[idx_te]
+)
+
+set.seed(2024)
+B <- 500
+
+boot_cate <- function(est, oracle) {
+  n <- length(est)  # <- use length for vector
+  idx <- sample(seq_len(n), replace = TRUE)
+  c(
+    est_mean = mean(est[idx]),
+    oracle_mean = mean(oracle[idx])
+  )
+}
+
+boot_tau10 <- replicate(B, boot_cate(cate_hat[,1], cate_oracle[,1]))
+boot_tau20 <- replicate(B, boot_cate(cate_hat[,2], cate_oracle[,2]))
+
+# Construct CI table
+cate_ci <- data.frame(
+  Effect = c("CATE (a1 − a0)", "CATE (a2 − a0)"),
+  Est_Mean = c(mean(cate_hat[,1]), mean(cate_hat[,2])),
+  Est_L = c(quantile(boot_tau10["est_mean",], .025),
+            quantile(boot_tau20["est_mean",], .025)),
+  Est_U = c(quantile(boot_tau10["est_mean",], .975),
+            quantile(boot_tau20["est_mean",], .975)),
+  Oracle_Mean = c(mean(cate_oracle[,1]), mean(cate_oracle[,2])),
+  Oracle_L = c(quantile(boot_tau10["oracle_mean",], .025),
+               quantile(boot_tau20["oracle_mean",], .025)),
+  Oracle_U = c(quantile(boot_tau10["oracle_mean",], .975),
+               quantile(boot_tau20["oracle_mean",], .975))
+)
+
+cate_ci[, -1] <- round(cate_ci[, -1], 3)
+cate_ci
+
+heterogeneity_table <- data.frame(
+  Component = c(
+    "Dominant policy action",
+    "Policy concentration",
+    paste0("Cluster ", cluster_table$Cluster)
+  ),
+  Value = c(
+    names(which.max(table(pi_hat))),
+    round(max(policy_table$Proportion), 3),
+    paste0(
+      cluster_table$Size, " (",
+      cluster_table$Proportion, ")"
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+library(kableExtra)
+
+kable(
+  cate_ci,
+  format = "latex",
+  booktabs = TRUE,
+  caption = "Oracle vs Estimated CATEs with Bootstrap 95\\% Confidence Intervals",
+  col.names = c(
+    "Effect",
+    "Est. Mean", "Est. 2.5\\%", "Est. 97.5\\%",
+    "Oracle Mean", "Oracle 2.5\\%", "Oracle 97.5\\%"
+  )
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    font_size = 9
   )
 
-print(cluster_profiles)
 
-# --- 15) PCA plot ---
-pca <- prcomp(scale(cate_wgt))
-pca_df <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2],
-                     cluster = factor(km_wgt$cluster), true_best = factor(true_best_action))
-ggplot(pca_df, aes(PC1, PC2, color = cluster, shape = true_best)) +
-  geom_point(alpha = 0.8, size = 2) +
-  labs(title = "PCA of estimated CATEs (weighted model) - clusters vs true best action") +
-  theme_minimal()
+kable(
+  heterogeneity_table,
+  format = "latex",
+  booktabs = TRUE,
+  caption = "Policy Concentration and CATE Cluster Distribution"
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    font_size = 9
+  )
 
 
-################
-### Real Data
-################
 
-# Real-data adaptation of temporal multivariate CNN-LSTM DQN + clustering
-# Dataset: nycflights13 (flights + hourly weather at JFK/LGA/EWR)
-# Spatio-temporal fix: Use last T_steps hours of weather for the origin airport,
-# and spatial lag = mean of the same features from the other two NYC airports at the same hours.
-# Actions (3): departure time-of-day buckets (morning/afternoon/evening).
-# Rewards (2): r1 = -|dep_delay|, r2 = -|arr_delay| (higher is better).
-# Evaluation: Off-policy IPS estimate using a multinomial propensity model.
+############################################################
+# Real-data CNN–LSTM DQN + CATE Clustering (NYC Flights)
+############################################################
 
 # --- Packages ---
 needed <- c(
-  "keras", "tensorflow", "nycflights13", "dplyr", "tidyr", "lubridate",
-  "purrr", "stringr", "nnet", "mclust", "cluster", "ggplot2"
+  "keras","tensorflow","nycflights13","dplyr","tidyr","lubridate",
+  "purrr","stringr","nnet","mclust","cluster","ggplot2","knitr"
 )
-for (p in needed) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
-
-library(keras); library(tensorflow)
-library(dplyr); library(tidyr); library(lubridate); library(purrr); library(stringr)
-library(nycflights13); library(nnet)
-library(mclust); library(cluster); library(ggplot2)
+for (p in needed) if (!requireNamespace(p, quietly=TRUE)) install.packages(p)
+lapply(needed, library, character.only = TRUE)
 
 set.seed(123)
 
-# Define the feature variables we want from weather
-feat_vars <- c("temp", "dewp", "humid", "wind_dir", "wind_speed", "wind_gust",
-               "precip", "pressure", "visib")
+############################################################
+# 1. PARAMETERS
+############################################################
 
-
-
-# --- Parameters ---
 T_steps <- 10
+feat_vars <- c("temp","dewp","humid","wind_dir","wind_speed","wind_gust","precip","pressure","visib")
 p <- length(feat_vars)
 n_actions <- 3
 n_rewards <- 2
 train_frac <- 0.7
 reward_weights <- c(0.6, 0.4)
 
+############################################################
+# 2. WEATHER DATA
+############################################################
 
-# --- Helper: build hourly time index for each flight and collect last T_steps weather rows ---
-# NYC weather is available hourly for JFK/LGA/EWR in nycflights13::weather
 wx <- nycflights13::weather %>%
   mutate(ts = make_datetime(year, month, day, hour)) %>%
-  dplyr::select(origin, ts, dplyr::all_of(feat_vars)) %>%
-  arrange(origin, ts)
+  dplyr::select(c("origin","ts",feat_vars)) %>%
+  arrange(origin, ts) %>%
+  group_by(origin) %>% fill(all_of(feat_vars), .direction="downup") %>% ungroup()
 
-# quickly impute small NAs by forward/backward fill within each airport
-wx <- wx %>% group_by(origin) %>% arrange(ts, .by_group = TRUE) %>%
-  tidyr::fill(all_of(feat_vars), .direction = "downup") %>% ungroup()
+############################################################
+# 3. FLIGHTS DATA + ACTIONS + REWARDS
+############################################################
 
-# We will use flights with non-missing dep/arr delays and a known scheduled departure hour
 fl <- nycflights13::flights %>%
   mutate(
-    sched_dep_hour = floor(sched_dep_time / 100),
+    sched_dep_hour = floor(sched_dep_time/100),
     ts_dep = make_datetime(year, month, day, sched_dep_hour)
   ) %>%
-  filter(origin %in% c("JFK", "LGA", "EWR")) %>%
+  filter(origin %in% c("JFK","LGA","EWR")) %>%
   filter(!is.na(dep_delay), !is.na(arr_delay), !is.na(ts_dep)) %>%
   dplyr::select(year, month, day, origin, dest, carrier, flight,
                 ts_dep, dep_delay, arr_delay)
 
-
-# Define 3 actions from time-of-day buckets (roughly uniform-ish)
-# 0 = morning [5, 12), 1 = afternoon [12, 18), 2 = evening/night otherwise
-bucket_of_hour <- function(h) {
-  if (h >= 5 & h < 12) return(0L)
-  if (h >= 12 & h < 18) return(1L)
+# Actions: 0=morning [5-12), 1=afternoon [12-18), 2=evening/night
+bucket_of_hour <- function(h){
+  if(h>=5 & h<12) return(0L)
+  if(h>=12 & h<18) return(1L)
   return(2L)
 }
 fl <- fl %>% mutate(action = vapply(hour(ts_dep), bucket_of_hour, integer(1)))
 
-# Build neighbor airports for spatial lag: for each origin, neighbors are the other two NYC airports
-neighbors <- list(
-  JFK = c("LGA", "EWR"),
-  LGA = c("JFK", "EWR"),
-  EWR = c("JFK", "LGA")
-)
+# Rewards: negative absolute delays
+Y_obs <- cbind(-abs(fl$dep_delay), -abs(fl$arr_delay))
 
-# function to fetch last T_steps hourly weather for origin and neighbor average
-get_seq_row <- function(origin, ts_dep) {
-  times <- ts_dep - hours(T_steps:1) + hours(1)  # previous T_steps hours: (t-9 ... t)
+############################################################
+# 4. SPATIO-TEMPORAL FEATURES
+############################################################
+
+neighbors <- list(JFK=c("LGA","EWR"), LGA=c("JFK","EWR"), EWR=c("JFK","LGA"))
+
+get_seq_row <- function(origin, ts_dep){
+  times <- ts_dep - hours(T_steps:1) + hours(1)
   # origin features
-  wx_o <- wx %>% filter(origin == !!origin, ts %in% times) %>% arrange(ts)
-  if (nrow(wx_o) != T_steps) return(NULL)
+  wx_o <- wx %>% filter(origin==!!origin, ts %in% times) %>% arrange(ts)
+  if(nrow(wx_o)!=T_steps) return(NULL)
   Xo <- as.matrix(wx_o[, feat_vars])
   # neighbor mean
   nb <- neighbors[[origin]]
   wx_n <- wx %>% filter(origin %in% nb, ts %in% times) %>%
-    group_by(ts) %>% summarise(across(all_of(feat_vars), mean, na.rm = TRUE), .groups = "drop") %>%
+    group_by(ts) %>% summarise(across(all_of(feat_vars), mean, na.rm=TRUE), .groups="drop") %>%
     arrange(ts)
-  if (nrow(wx_n) != T_steps) return(NULL)
+  if(nrow(wx_n)!=T_steps) return(NULL)
   Xn <- as.matrix(wx_n[, feat_vars])
-  list(Xo = Xo, Xn = Xn)
+  list(Xo=Xo, Xn=Xn)
 }
 
-# Sample a manageable subset for speed (you can raise n_max if you have GPU)
+# Subsample for speed
 n_max <- 8000
-fl_sub <- fl %>% slice_sample(n = min(n_max, nrow(fl)))
+fl_sub <- fl %>% slice_sample(n=min(n_max,nrow(fl)))
+Y_sub <- Y_obs[as.numeric(rownames(fl_sub)), ]
 
-# Build tensors
 rows <- vector("list", nrow(fl_sub))
 keep <- rep(FALSE, nrow(fl_sub))
-for (i in seq_len(nrow(fl_sub))) {
+for(i in seq_len(nrow(fl_sub))){
   gi <- get_seq_row(fl_sub$origin[i], fl_sub$ts_dep[i])
-  if (!is.null(gi)) { rows[[i]] <- gi; keep[i] <- TRUE }
+  if(!is.null(gi)){ rows[[i]] <- gi; keep[i] <- TRUE }
 }
 fl_sub <- fl_sub[keep, ]
+Y_sub <- Y_sub[keep, ]
 rows <- rows[keep]
-
 n <- nrow(fl_sub)
-X_origin <- array(NA_real_, dim = c(n, T_steps, p))
-X_spat   <- array(NA_real_, dim = c(n, T_steps, p))
-for (i in seq_len(n)) {
-  X_origin[i, , ] <- rows[[i]]$Xo
-  X_spat[i, , ]   <- rows[[i]]$Xn
-}
 
-# Combine origin + spatial lag features
-X_combined <- array(NA_real_, dim = c(n, T_steps, 2 * p))
-X_combined[, , 1:p] <- X_origin
-X_combined[, , (p + 1):(2 * p)] <- X_spat
+X_origin <- array(NA_real_, dim=c(n,T_steps,p))
+X_spat   <- array(NA_real_, dim=c(n,T_steps,p))
+for(i in seq_len(n)){ X_origin[i,,] <- rows[[i]]$Xo; X_spat[i,,] <- rows[[i]]$Xn }
+
+# Combined features
+X_combined <- array(NA_real_, dim=c(n,T_steps,2*p))
+X_combined[,,1:p] <- X_origin
+X_combined[,,(p+1):(2*p)] <- X_spat
 p_final <- dim(X_combined)[3]
 
-# Standardize each feature per time step (robust)
-for (j in seq_len(p_final)) {
-  for (t in seq_len(T_steps)) {
-    v <- X_combined[, t, j]
-    mu <- mean(v, na.rm = TRUE); sdv <- sd(v, na.rm = TRUE); if (!is.finite(sdv) || sdv == 0) sdv <- 1
-    X_combined[, t, j] <- (v - mu) / sdv
+# Standardization per feature per time-step
+for(j in seq_len(p_final)){
+  for(t in seq_len(T_steps)){
+    v <- X_combined[,t,j]; mu <- mean(v, na.rm=TRUE); sdv <- sd(v, na.rm=TRUE)
+    if(!is.finite(sdv) || sdv==0) sdv <- 1
+    X_combined[,t,j] <- (v-mu)/sdv
   }
 }
 X_combined[!is.finite(X_combined)] <- 0
 
 # Actions and rewards
 W <- fl_sub$action
-Y_obs <- cbind(-abs(fl_sub$dep_delay), -abs(fl_sub$arr_delay))
+Y_obs_train <- Y_sub
 
 # Train/test split
 set.seed(123)
-idx <- sample(seq_len(n), floor(train_frac * n))
-X_train <- X_combined[idx, , , drop = FALSE]
-X_test  <- X_combined[-idx, , , drop = FALSE]
+idx <- sample(seq_len(n), floor(train_frac*n))
+X_train <- X_combined[idx,,]
+X_test  <- X_combined[-idx,,]
 W_train <- W[idx]; W_test <- W[-idx]
-Y_obs_train <- Y_obs[idx, , drop = FALSE]
-Y_obs_test  <- Y_obs[-idx, , drop = FALSE]
+Y_obs_train <- Y_sub[idx,]; Y_obs_test <- Y_sub[-idx,]
 
-# --- Model ---
-build_model <- function(T_steps, p, n_actions, n_rewards, lr = 1e-4) {
+############################################################
+# 5. CNN-LSTM MODEL
+############################################################
+
+build_model <- function(T_steps, p, n_actions, n_rewards, lr=1e-4){
   model <- keras_model_sequential() %>%
-    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu",
-                  input_shape = c(T_steps, p), padding = "causal") %>%
-    layer_lstm(units = 48, return_sequences = FALSE) %>%
-    layer_dense(units = 48, activation = "relu") %>%
-    layer_dense(units = n_actions * n_rewards, activation = "linear")
+    layer_conv_1d(filters=32, kernel_size=3, activation="relu",
+                  input_shape=c(T_steps,p), padding="causal") %>%
+    layer_lstm(units=48, return_sequences=FALSE) %>%
+    layer_dense(units=48, activation="relu") %>%
+    layer_dense(units=n_actions*n_rewards, activation="linear")
   
-  weighted_mse <- function(y_true, y_pred) {
-    y_true_r <- k_reshape(y_true, shape = c(-1, n_actions, n_rewards))
-    y_pred_r <- k_reshape(y_pred, shape = c(-1, n_actions, n_rewards))
-    w_vec <- k_constant(c(0.6, 0.4))
+  weighted_mse <- function(y_true, y_pred){
+    y_true_r <- k_reshape(y_true, c(-1,n_actions,n_rewards))
+    y_pred_r <- k_reshape(y_pred, c(-1,n_actions,n_rewards))
     se <- k_square(y_true_r - y_pred_r)
+    w_vec <- k_constant(reward_weights)
     se_w <- se * w_vec
     k_mean(se_w)
   }
-  model %>% compile(optimizer = optimizer_adam(learning_rate = lr), loss = weighted_mse)
+  model %>% compile(optimizer=optimizer_adam(lr), loss=weighted_mse)
   model
 }
 
 model <- build_model(T_steps, p_final, n_actions, n_rewards)
+model2 <- build_model(T_steps, p_final, n_actions, n_rewards)
 
-# sampling weights
-softmax_vec <- function(x) { ex <- exp(x - max(x)); ex / sum(ex) }
-get_sampling_weights <- function(model, X_input) {
-  q_vals <- predict(model, X_input, verbose = 0)
-  q_vals_array <- array(q_vals, dim = c(nrow(X_input), n_actions, n_rewards))
-  q_sum <- apply(q_vals_array, c(1, 2), sum)
-  prob_q <- t(apply(q_sum, 1, function(r) softmax_vec(r)))
-  entropy <- -rowSums(prob_q * log(prob_q + 1e-10))
-  qvar <- apply(q_sum, 1, var)
-  combined <- entropy + qvar
-  w <- combined / max(combined)
-  w[is.na(w)] <- 1 / nrow(X_input)
-  w
-}
+############################################################
+# 6. TRAIN DQN
+############################################################
 
-# Training
-train_dqn <- function(X_train, W_train, Y_obs_train, epochs = 40, batch_size = 64,
-                      weighted_sampling = FALSE, model_init = NULL, verbose_each = 10) {
+train_dqn <- function(X_train, W_train, Y_train, epochs=40, batch_size=64,
+                      weighted_sampling=FALSE, model_init=NULL, verbose_each=10){
   n_train <- dim(X_train)[1]
-  if (is.null(model_init)) mod <- build_model(dim(X_train)[2], dim(X_train)[3], n_actions, n_rewards) else mod <- model_init
+  if(is.null(model_init)) mod <- build_model(dim(X_train)[2], dim(X_train)[3], n_actions, n_rewards)
+  else mod <- model_init
   reward_log <- numeric(epochs)
-  for (ep in seq_len(epochs)) {
-    if (weighted_sampling && ep > 1) {
-      weights <- get_sampling_weights(mod, X_train)
-      sample_idx <- sample(seq_len(n_train), n_train, replace = TRUE, prob = weights)
-    } else {
-      sample_idx <- sample(seq_len(n_train), n_train, replace = TRUE)
-    }
-    Xb_all <- X_train[sample_idx, , , drop = FALSE]
-    Wb_all <- W_train[sample_idx]
-    Yb_all <- Y_obs_train[sample_idx, , drop = FALSE]
+  
+  for(ep in seq_len(epochs)){
+    if(weighted_sampling && ep>1){
+      # simple uniform weights for now
+      sample_idx <- sample(seq_len(n_train), n_train, replace=TRUE)
+    } else { sample_idx <- sample(seq_len(n_train), n_train, replace=TRUE) }
     
     # mini-batches
-    splits <- split(seq_len(n_train), ceiling(seq_along(seq_len(n_train)) / batch_size))
-    ep_rewards <- numeric(length(splits))
-    for (i in seq_along(splits)) {
+    splits <- split(seq_len(n_train), ceiling(seq_along(seq_len(n_train))/batch_size))
+    for(i in seq_along(splits)){
       ids <- splits[[i]]
-      Xb <- Xb_all[ids, , , drop = FALSE]
-      Wb <- Wb_all[ids]
-      Yb <- Yb_all[ids, , drop = FALSE]
+      Xb <- X_train[ids,,]; Wb <- W_train[ids]; Yb <- Y_train[ids,]
       Xb[!is.finite(Xb)] <- 0; Yb[!is.finite(Yb)] <- 0
-      
-      Q_pred <- predict(mod, Xb, verbose = 0)
-      Qt_array <- array(Q_pred, dim = c(nrow(Xb), n_actions, n_rewards))
-      for (ii in seq_len(nrow(Xb))) {
-        act <- Wb[ii] + 1
-        Qt_array[ii, act, ] <- Yb[ii, ]
-      }
-      Q_target_new <- matrix(Qt_array, nrow = nrow(Xb), ncol = n_actions * n_rewards)
-      mod %>% fit(x = Xb, y = Q_target_new, epochs = 1, verbose = 0)
-      ep_rewards[i] <- mean(apply(Qt_array, 1, function(z) mean(z)))
+      Q_pred <- predict(mod, Xb, verbose=0)
+      Qt_array <- array(Q_pred, dim=c(nrow(Xb), n_actions, n_rewards))
+      for(ii in seq_len(nrow(Xb))){ act <- Wb[ii]+1; Qt_array[ii,act,] <- Yb[ii,] }
+      Q_target_new <- matrix(Qt_array, nrow=nrow(Xb), ncol=n_actions*n_rewards)
+      mod %>% fit(x=Xb, y=Q_target_new, epochs=1, verbose=0)
     }
-    reward_log[ep] <- mean(ep_rewards)
-    if (ep %% verbose_each == 0) cat("Epoch", ep, "mean batch reward:", round(reward_log[ep], 4), "\n")
+    if(ep %% verbose_each==0) cat("Epoch", ep, "done\n")
   }
-  list(model = mod, rewards = reward_log)
+  mod
 }
 
-# Train two variants
-set.seed(123)
-res_uniform <- train_dqn(X_train, W_train, Y_obs_train, epochs = 40, batch_size = 64,
-                         weighted_sampling = FALSE, model_init = model)
-set.seed(123)
-model2 <- build_model(T_steps, p_final, n_actions, n_rewards)
-res_weighted <- train_dqn(X_train, W_train, Y_obs_train, epochs = 40, batch_size = 64,
-                          weighted_sampling = TRUE, model_init = model2)
+# Train models
+res_uniform <- train_dqn(X_train, W_train, Y_obs_train, epochs=40, batch_size=64,
+                         weighted_sampling=FALSE, model_init=model)
+res_weighted <- train_dqn(X_train, W_train, Y_obs_train, epochs=40, batch_size=64,
+                          weighted_sampling=TRUE, model_init=model2)
 
-# Predict Q-values on test
-q_uni <- predict(res_uniform$model, X_test, verbose = 0)
-q_wgt <- predict(res_weighted$model, X_test, verbose = 0)
-q_uni_arr <- array(q_uni, dim = c(nrow(X_test), n_actions, n_rewards))
-q_wgt_arr <- array(q_wgt, dim = c(nrow(X_test), n_actions, n_rewards))
+############################################################
+# 7. PREDICTION + Q-VALUES
+############################################################
 
-q_uni_scalar <- apply(q_uni_arr, c(1, 2), function(x) sum(x * reward_weights))
-q_wgt_scalar <- apply(q_wgt_arr, c(1, 2), function(x) sum(x * reward_weights))
+q_uni <- predict(res_uniform, X_test, verbose=0)
+q_wgt <- predict(res_weighted, X_test, verbose=0)
+q_uni_arr <- array(q_uni, dim=c(nrow(X_test), n_actions, n_rewards))
+q_wgt_arr <- array(q_wgt, dim=c(nrow(X_test), n_actions, n_rewards))
 
-pred_action_uni <- apply(q_uni_scalar, 1, which.max) - 1
-pred_action_wgt <- apply(q_wgt_scalar, 1, which.max) - 1
+q_uni_scalar <- apply(q_uni_arr, c(1,2), function(x) sum(x*reward_weights))
+q_wgt_scalar <- apply(q_wgt_arr, c(1,2), function(x) sum(x*reward_weights))
 
-# --- IPS evaluation (off-policy) ---
-# Fit propensity model on TRAIN (multinomial over actions)
-# Use flattened mean of features over time as covariates for simplicity
-flatten_feats <- function(X) {
-  # mean over time for each feature
-  apply(X, c(1,3), mean)
-}
+pred_action_uni <- apply(q_uni_scalar, 1, which.max)-1
+pred_action_wgt <- apply(q_wgt_scalar, 1, which.max)-1
+
+############################################################
+# 8. IPS OFF-POLICY EVALUATION
+############################################################
+
+flatten_feats <- function(X){ apply(X, c(1,3), mean) }
 X_train_flat <- flatten_feats(X_train) %>% as.data.frame()
 X_test_flat  <- flatten_feats(X_test)  %>% as.data.frame()
 colnames(X_train_flat) <- paste0("f", seq_len(ncol(X_train_flat)))
 colnames(X_test_flat)  <- paste0("f", seq_len(ncol(X_test_flat)))
 
-prop_model <- nnet::multinom(factor(W_train) ~ ., data = cbind.data.frame(W_train = factor(W_train), X_train_flat), trace = FALSE)
-phat_mat <- predict(prop_model, newdata = X_test_flat, type = "probs")
-
-# logged action = W_test, logged reward = scalar reward
+prop_model <- nnet::multinom(factor(W_train) ~ ., data=cbind.data.frame(W_train=factor(W_train), X_train_flat), trace=FALSE)
+phat_mat <- predict(prop_model, newdata=X_test_flat, type="probs")
 r_test_scalar <- as.numeric(Y_obs_test %*% reward_weights)
-# value of learned policies via IPS
-policy_value_ips <- function(pred_actions) {
-  take <- as.integer(pred_actions) + 1L
-  numer <- ifelse(W_test == pred_actions, r_test_scalar, 0)
+
+policy_value_ips <- function(pred_actions){
+  take <- as.integer(pred_actions)+1L
+  numer <- ifelse(W_test==pred_actions, r_test_scalar, 0)
   denom <- phat_mat[cbind(seq_along(take), take)]
-  mean(numer / pmax(denom, 1e-6))
+  mean(numer/pmax(denom,1e-6))
 }
 
-val_uni  <- policy_value_ips(pred_action_uni)
-val_wgt  <- policy_value_ips(pred_action_wgt)
-val_log  <- mean(r_test_scalar)  # naive on-policy average of logged behavior
-cat(sprintf("\nIPS value (uniform):  %.4f\nIPS value (weighted): %.4f\nLogged policy avg:  %.4f\n", val_uni, val_wgt, val_log))
+val_uni <- policy_value_ips(pred_action_uni)
+val_wgt <- policy_value_ips(pred_action_wgt)
+val_log <- mean(r_test_scalar)
+cat(sprintf("\nIPS uniform: %.4f, IPS weighted: %.4f, logged avg: %.4f\n", val_uni, val_wgt, val_log))
 
-# --- CATE-like contrasts and clustering (from predicted Q) ---
-cate_uni <- cbind(
-  tau10 = q_uni_scalar[, 2] - q_uni_scalar[, 1],
-  tau20 = q_uni_scalar[, 3] - q_uni_scalar[, 1]
-)
-cate_wgt <- cbind(
-  tau10 = q_wgt_scalar[, 2] - q_wgt_scalar[, 1],
-  tau20 = q_wgt_scalar[, 3] - q_wgt_scalar[, 1]
-)
+############################################################
+# 9. CATE-like contrasts + clustering
+############################################################
+
+cate_uni <- cbind(tau10=q_uni_scalar[,2]-q_uni_scalar[,1],
+                  tau20=q_uni_scalar[,3]-q_uni_scalar[,1])
+cate_wgt <- cbind(tau10=q_wgt_scalar[,2]-q_wgt_scalar[,1],
+                  tau20=q_wgt_scalar[,3]-q_wgt_scalar[,1])
 
 set.seed(42)
 k <- 4
-km_wgt <- kmeans(scale(cate_wgt), centers = k, nstart = 50)
+km_wgt <- kmeans(scale(cate_wgt), centers=k, nstart=50)
 
-# Cluster profile summary (no ground-truth tau on real data)
-df_summary <- data.frame(
-  cluster = km_wgt$cluster,
-  tau10_hat = cate_wgt[, 1],
-  tau20_hat = cate_wgt[, 2],
-  dep_delay = Y_obs_test[,1],
-  arr_delay = Y_obs_test[,2]
-)
+df_summary <- data.frame(cluster=km_wgt$cluster,
+                         tau10_hat=cate_wgt[,1],
+                         tau20_hat=cate_wgt[,2],
+                         dep_delay=Y_obs_test[,1],
+                         arr_delay=Y_obs_test[,2])
+
 cluster_profiles <- df_summary %>%
   group_by(cluster) %>%
   summarise(
-    n = n(),
-    mean_tau10 = mean(tau10_hat),
-    mean_tau20 = mean(tau20_hat),
-    mean_dep_delay = mean(dep_delay),
-    mean_arr_delay = mean(arr_delay)
+    n=n(),
+    mean_tau10=mean(tau10_hat),
+    mean_tau20=mean(tau20_hat),
+    mean_dep_delay=mean(dep_delay),
+    mean_arr_delay=mean(arr_delay)
   )
 print(cluster_profiles)
 
-# --- Visualization: PCA of CATEs and clusters ---
+############################################################
+# 10. PCA visualization
+############################################################
+
 pca <- prcomp(scale(cate_wgt))
-pca_df <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], cluster = factor(km_wgt$cluster))
+pca_df <- data.frame(PC1=pca$x[,1], PC2=pca$x[,2], cluster=factor(km_wgt$cluster))
 
 print(
-  ggplot(pca_df, aes(PC1, PC2, color = cluster)) +
-    geom_point(alpha = 0.8, size = 2) +
-    labs(title = "PCA of estimated CATE-like contrasts (weighted model)") +
+  ggplot(pca_df, aes(PC1, PC2, color=cluster)) +
+    geom_point(alpha=0.8, size=2) +
+    labs(title="PCA of estimated CATE-like contrasts (weighted model)") +
     theme_minimal()
 )
+
+############################################################
+# 11. POLICY DISTRIBUTION TABLE
+############################################################
+
+policy_table <- as.data.frame(table(pred_action_wgt))
+colnames(policy_table) <- c("Action","Count")
+policy_table$Proportion <- round(policy_table$Count / sum(policy_table$Count), 3)
+
+############################################################
+# 12. CLUSTER + CATE SUMMARY WITH BOOTSTRAP CIs
+############################################################
+
+B <- 500  # bootstrap replicates
+set.seed(123)
+
+boot_mean_ci <- function(x, B=500, alpha=0.05){
+  n <- length(x)
+  boot_means <- replicate(B, mean(sample(x, n, replace=TRUE)))
+  c(
+    mean = mean(x),
+    lower = quantile(boot_means, alpha/2),
+    upper = quantile(boot_means, 1-alpha/2)
+  )
+}
+
+cluster_summary <- df_summary %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    mean_tau10 = boot_mean_ci(tau10_hat, B=B)[1],
+    ci_tau10_lower = boot_mean_ci(tau10_hat, B=B)[2],
+    ci_tau10_upper = boot_mean_ci(tau10_hat, B=B)[3],
+    mean_tau20 = boot_mean_ci(tau20_hat, B=B)[1],
+    ci_tau20_lower = boot_mean_ci(tau20_hat, B=B)[2],
+    ci_tau20_upper = boot_mean_ci(tau20_hat, B=B)[3],
+    mean_dep_delay = mean(dep_delay),
+    mean_arr_delay = mean(arr_delay)
+  ) %>%
+  ungroup()
+
+############################################################
+# 13. MERGE POLICY + CLUSTER TABLES
+############################################################
+
+# Create one heterogeneity table for LaTeX
+heterogeneity_table <- list(
+  "Policy Distribution" = policy_table,
+  "Cluster CATE Summary" = cluster_summary
+)
+
+# Output to LaTeX using knitr::kable
+library(knitr)
+
+cat("\n%--- POLICY DISTRIBUTION ---\n")
+kable(policy_table, format="latex", booktabs=TRUE,
+      caption="Learned Policy Distribution (Weighted Model)")
+
+cat("\n%--- CLUSTER + CATE SUMMARY ---\n")
+kable(cluster_summary, format="latex", booktabs=TRUE,
+      caption="Cluster-wise Estimated CATEs with Bootstrap 95% CIs")
+
